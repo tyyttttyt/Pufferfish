@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: usehoplite[bot] <288093033+usehoplite[bot]@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 00:40:00 +0000
+Subject: [PATCH] Make admin command input errors safe and actionable
+
+diff --git a/src/main/java/gg/pufferfish/pufferfish/PufferfishCommand.java b/src/main/java/gg/pufferfish/pufferfish/PufferfishCommand.java
+--- a/src/main/java/gg/pufferfish/pufferfish/PufferfishCommand.java
++++ b/src/main/java/gg/pufferfish/pufferfish/PufferfishCommand.java
+@@ -44,7 +44,7 @@
+ 
+         if (args.length != 1) {
+             sender.sendMessage(prefix + "Usage: " + usageMessage);
+-            args = new String[]{"version"};
++            return true;
+         }
+ 
+         if (args[0].equalsIgnoreCase("reload")) {
+@@ -61,6 +61,8 @@
+             Command.broadcastCommandMessage(sender, prefix + "Pufferfish configuration has been reloaded.");
+         } else if (args[0].equalsIgnoreCase("version")) {
+             Command.broadcastCommandMessage(sender, prefix + "This server is running " + Bukkit.getName() + " version " + Bukkit.getVersion() + " (Implementing API version " + Bukkit.getBukkitVersion() + ")");
++        } else {
++            sender.sendMessage(prefix + "Usage: " + usageMessage);
+         }
+ 
+         return true;
+diff --git a/src/main/java/gg/pufferfish/pufferfish/flare/FlareCommand.java b/src/main/java/gg/pufferfish/pufferfish/flare/FlareCommand.java
+--- a/src/main/java/gg/pufferfish/pufferfish/flare/FlareCommand.java
++++ b/src/main/java/gg/pufferfish/pufferfish/flare/FlareCommand.java
+@@ -22,6 +22,7 @@
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
++import java.util.Locale;
+ 
+ public class FlareCommand extends Command {
+ 
+@@ -55,9 +56,17 @@
+               Component.text("Profiling is not supported in this environment, check your startup logs for the error.", NamedTextColor.RED)));
+             return true;
+         }
++        if (args.length > 1) {
++            sender.sendMessage(PREFIX.append(Component.text("Usage: /" + commandLabel + " [status | stop | <profile type>]", HEX)));
++            return true;
++        }
+         if (ProfilingManager.isProfiling()) {
+             if (args.length == 1 && args[0].equalsIgnoreCase("status")) {
+                 sender.sendMessage(PREFIX.append(Component.text("Current profile has been ran for " + ProfilingManager.getTimeRan().toString(), HEX)));
++                return true;
++            }
++            if (args.length == 1 && !args[0].equalsIgnoreCase("stop")) {
++                sender.sendMessage(PREFIX.append(Component.text("Usage: /" + commandLabel + " [status | stop]", HEX)));
+                 return true;
+             }
+             if (ProfilingManager.stop()) {
+@@ -68,16 +77,21 @@
+                 sender.sendMessage(PREFIX.append(Component.text("Profiling has already been stopped.", HEX)));
+             }
+         } else {
++            if (args.length == 1 && (args[0].equalsIgnoreCase("status") || args[0].equalsIgnoreCase("stop"))) {
++                sender.sendMessage(PREFIX.append(Component.text("No profile is currently running.", HEX)));
++                return true;
++            }
+             ProfileType profileType = ProfileType.ITIMER;
+             if (args.length > 0) {
+                 try {
+-                    profileType = ProfileType.valueOf(args[0].toUpperCase());
+-                } catch (Exception e) {
++                    profileType = ProfileType.valueOf(args[0].toUpperCase(Locale.ROOT));
++                } catch (IllegalArgumentException e) {
+                     sender.sendMessage(PREFIX.append(Component
+                       .text("Invalid profile type ", HEX)
+                       .append(Component.text(args[0], HEX, TextDecoration.BOLD)
+                         .append(Component.text("!", HEX)))
+                     ));
++                    return true;
+                 }
+             }
+             ProfileType finalProfileType = profileType;
+diff --git a/src/test/java/gg/pufferfish/pufferfish/CommandUxRegressionTest.java b/src/test/java/gg/pufferfish/pufferfish/CommandUxRegressionTest.java
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/gg/pufferfish/pufferfish/CommandUxRegressionTest.java
+@@ -0,0 +1,145 @@
++package gg.pufferfish.pufferfish;
++
++import gg.pufferfish.pufferfish.flare.FlareCommand;
++import gg.pufferfish.pufferfish.flare.FlareSetup;
++import gg.pufferfish.pufferfish.flare.ProfilingManager;
++import co.technove.flare.Flare;
++import net.kyori.adventure.text.Component;
++import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
++import org.bukkit.Bukkit;
++import org.bukkit.Server;
++import org.bukkit.command.CommandSender;
++import org.bukkit.craftbukkit.scheduler.MinecraftInternalPlugin;
++import org.bukkit.scheduler.BukkitScheduler;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Locale;
++
++import static org.junit.jupiter.api.Assertions.*;
++import static org.mockito.ArgumentMatchers.*;
++import static org.mockito.Mockito.*;
++
++class CommandUxRegressionTest {
++    private static final PlainTextComponentSerializer PLAIN = PlainTextComponentSerializer.plainText();
++    private final Field supported = field(FlareSetup.class, "supported");
++    private final Field currentFlare = field(ProfilingManager.class, "currentFlare");
++    private final Field bukkitServer = field(Bukkit.class, "server");
++    private BukkitScheduler scheduler;
++    private Object oldServer;
++    private boolean oldSupported;
++    private Object oldFlare;
++    private String oldToken;
++
++    @BeforeEach void enableFlareCommand() throws Exception {
++        oldSupported = supported.getBoolean(null);
++        oldFlare = currentFlare.get(null);
++        oldToken = PufferfishConfig.accessToken;
++        oldServer = bukkitServer.get(null);
++        Server server = mock(Server.class);
++        scheduler = mock(BukkitScheduler.class);
++        when(server.getScheduler()).thenReturn(scheduler);
++        bukkitServer.set(null, server);
++        currentFlare.set(null, null);
++        supported.setBoolean(null, true);
++        PufferfishConfig.accessToken = "test-token";
++    }
++
++    @AfterEach void restoreFlareState() throws Exception {
++        supported.setBoolean(null, oldSupported);
++        currentFlare.set(null, oldFlare);
++        PufferfishConfig.accessToken = oldToken;
++        bukkitServer.set(null, oldServer);
++    }
++
++    @Test void pufferfishUnknownNoArgsAndExtraArgsShowUsage() {
++        for (String[] args : List.of(new String[]{"wat"}, new String[]{}, new String[]{"version", "extra"})) {
++            CommandSender sender = allowedSender();
++            assertTrue(new PufferfishCommand().execute(sender, "pufferfish", args));
++            verify(sender).sendMessage(org.mockito.ArgumentMatchers.<String>argThat(message -> message.contains("Usage: /pufferfish")));
++            verify(sender, times(1)).sendMessage(anyString());
++        }
++    }
++
++    @Test void pufferfishPermissionDenialStopsBeforeCommandWork() {
++        CommandSender sender = mock(CommandSender.class);
++        Component denied = Component.text("Permission denied for test");
++        PufferfishCommand command = new PufferfishCommand();
++        command.permissionMessage(denied);
++        assertTrue(command.execute(sender, "pufferfish", new String[]{"wat"}));
++        verify(sender).sendMessage(denied);
++    }
++
++    @Test void flareRejectsExtraArgsAndInvalidProfileWithoutScheduling() {
++        for (String[] args : List.of(new String[]{"itimer", "extra"}, new String[]{"not-a-profile"})) {
++            CommandSender sender = allowedSender();
++            assertTrue(new FlareCommand().execute(sender, "flare", args));
++            String text = componentMessages(sender).toString();
++            assertTrue(text.contains(args.length == 2 ? "Usage" : "Invalid profile type"), text);
++            verify(scheduler, never()).runTaskAsynchronously(any(MinecraftInternalPlugin.class), any(Runnable.class));
++        }
++    }
++
++    @Test void flareIdleStopAndStatusExplainNoProfileIsRunning() {
++        for (String[] args : List.of(new String[]{"stop"}, new String[]{"status"})) {
++            CommandSender sender = allowedSender();
++            assertTrue(new FlareCommand().execute(sender, "flare", args));
++            assertTrue(componentMessages(sender).toString().contains("No profile is currently running."));
++            verify(scheduler, never()).runTaskAsynchronously(any(MinecraftInternalPlugin.class), any(Runnable.class));
++        }
++    }
++
++    @Test void flareActiveTypoShowsUsageAndDoesNotStopProfile() throws Exception {
++        Flare active = mock(Flare.class);
++        when(active.isRunning()).thenReturn(true);
++        currentFlare.set(null, active);
++        CommandSender sender = allowedSender();
++        assertTrue(new FlareCommand().execute(sender, "flare", new String[]{"typo"}));
++        assertTrue(componentMessages(sender).toString().contains("Usage"));
++        assertTrue(ProfilingManager.isProfiling());
++        verify(active, never()).stop();
++        verify(scheduler, never()).runTaskAsynchronously(any(MinecraftInternalPlugin.class), any(Runnable.class));
++    }
++
++    @Test void flareProfileNameParsingUsesRootLocale() throws Exception {
++        Locale oldLocale = Locale.getDefault();
++        try {
++            Locale.setDefault(Locale.forLanguageTag("tr-TR"));
++            CommandSender sender = allowedSender();
++            assertTrue(new FlareCommand().execute(sender, "flare", new String[]{"itimer"}));
++            verify(scheduler).runTaskAsynchronously(any(MinecraftInternalPlugin.class), any(Runnable.class));
++            verify(sender, never()).sendMessage(any(Component.class));
++        } finally {
++            Locale.setDefault(oldLocale);
++        }
++    }
++
++    private static CommandSender allowedSender() {
++        CommandSender sender = mock(CommandSender.class);
++        when(sender.hasPermission(anyString())).thenReturn(true);
++        return sender;
++    }
++
++    private static List<String> componentMessages(CommandSender sender) {
++        @SuppressWarnings("unchecked")
++        org.mockito.ArgumentCaptor<Component> captor = org.mockito.ArgumentCaptor.forClass(Component.class);
++        verify(sender, atLeastOnce()).sendMessage(captor.capture());
++        List<String> messages = new ArrayList<>();
++        for (Component component : captor.getAllValues()) messages.add(PLAIN.serialize(component));
++        return messages;
++    }
++
++    private static Field field(Class<?> type, String name) {
++        try {
++            Field field = type.getDeclaredField(name);
++            field.setAccessible(true);
++            return field;
++        } catch (ReflectiveOperationException e) {
++            throw new ExceptionInInitializerError(e);
++        }
++    }
++}
